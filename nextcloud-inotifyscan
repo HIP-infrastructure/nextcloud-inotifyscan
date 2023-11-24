@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 from __future__ import print_function
 
 import argparse
@@ -12,55 +12,23 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Dict, Optional, Tuple
 
 try:
   import configparser
 except ImportError:
   import ConfigParser as configparser
 
-logging.basicConfig(format='%(levelname)s - %(message)s')
+logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S')
 _logger = logging.getLogger()
 
 Instance = collections.namedtuple(
-    'Instance', 'interval occ users external_storage docker php')
+    'Instance', 'interval occ users external_storage docker')
 Folder = collections.namedtuple('Folder', 'occ_cmd path_prefix data_prefix')
 Task = collections.namedtuple('Task', 'occ_cmd paths')
 
 class EnvironNotFound(Exception):
   pass
-
-
-class PathMapper:
-
-  def __init__(self, docker: Optional[Tuple[str, str]]) -> None:
-    self._mappings: Dict[str, str] = {}
-
-    if not docker:
-      return
-
-    for mount in json.loads(
-        subprocess.check_output(
-            ['docker', 'inspect', '--format={{json .Mounts}}', docker[1]],
-            universal_newlines=True,
-        )):
-      path_in_container = mount['Destination']
-      path_on_host = mount['Source']
-      self._mappings[path_in_container] = path_on_host
-      _logger.info('mapping base path in container %s => %s',
-                   path_in_container, path_on_host)
-
-  def __call__(self, path: str) -> str:
-    if not self._mappings:
-      return path
-
-    for path_in_container, path_on_host in self._mappings.items():
-      if path.startswith(path_in_container):
-        mapped_path = path_on_host + path[len(path_in_container):]
-        _logger.info('mapping path in container %s => %s', path, mapped_path)
-        return mapped_path
-
-    return path
 
 def configparser_default(get_func, section, option, default):
   try:
@@ -73,17 +41,13 @@ def parse_config(config_file):
   """
   try:
     config = configparser.ConfigParser()
-    try:
-      config.read_file(config_file)
-    except AttributeError:
-      config.readfp(config_file)
+    config.read_file(config_file)
   except configparser.Error as e:
     _logger.fatal('config error: %s', e)
   for section in config.sections():
     try:
       interval = configparser_default(
           config.getfloat, section, 'interval', 1.0)
-      php = configparser_default(config.get, section, 'php', 'php')
       occ = config.get(section, 'occ')
       users = tuple(map(str.strip, config.get(section, 'user').split(',')))
       external_storage = configparser_default(
@@ -96,7 +60,7 @@ def parse_config(config_file):
           _logger.warning('docker must be specified as `username:container`')
           continue
       yield Instance(interval=interval, occ=occ, users=users,
-                     external_storage=external_storage, docker=docker, php=php)
+                     external_storage=external_storage, docker=docker)
     except configparser.Error as e:
       _logger.warning('config error: %s', e)
 
@@ -118,8 +82,7 @@ def parse_environ():
     docker = False
     occ = require_environ('NEXTCLOUD_HOME') + '/occ'
   return Instance(interval=interval, occ=occ, users=(user,),
-                  external_storage=None, docker=docker,
-                  php='php')
+                  external_storage=None, docker=docker)
 
 def parse_args():
   """Parse commandline arguments and yield Instance objects.
@@ -170,30 +133,61 @@ def scan(task):
                                   '--shallow', '--quiet'])
   task.paths.clear()
 
-def watch_instances(instances):
-  """Setup inotifywait for the given instances and yield tasks.
+def get_workers(instances, paths_watched):
+  """Generate workers.
   """
-  instances = tuple(instances)
   folders = []
   for instance in instances:
     if instance.docker:
       occ_cmd = ['docker', 'exec', '-u'+instance.docker[0], instance.docker[1],
-                 instance.php, instance.occ]
+                 'php', instance.occ]
+      print(occ_cmd)
     else:
-      occ_cmd = [instance.php, instance.occ]
-    path_mapper = PathMapper(instance.docker)
+      occ_cmd = ['php', instance.occ]
     data_dir = subprocess.check_output(
         occ_cmd+['config:system:get', 'datadirectory'],
         universal_newlines=True).rstrip()
-    data_dir = path_mapper(data_dir)
-    for user in instance.users:
+    users = json.loads(subprocess.check_output(
+        occ_cmd+['user:list', '--output=json'],
+        universal_newlines=True))
+    for user in users.keys():
       # path_prefix is the virtual folder recognized by Nextcloud
       # data_prefix is the actual filesystem folder
       # both should point to the same logical folder
       path_prefix = '/'+user+'/files'
       data_prefix = data_dir+path_prefix
-      folders.append(Folder(occ_cmd=occ_cmd, path_prefix=path_prefix,
-                            data_prefix=data_prefix))
+      if(os.path.isdir(data_prefix)):
+        # only add if we aren't already watching that path
+        if data_prefix not in paths_watched:
+          paths_watched.add(data_prefix)
+          folders.append(Folder(occ_cmd=occ_cmd, path_prefix=path_prefix,
+                                data_prefix=data_prefix))
+          _logger.debug('Watching user %s.', user)
+    group_folders = json.loads(subprocess.check_output(
+        occ_cmd+['groupfolders:list', '--output=json'],
+        universal_newlines=True))
+    groups = json.loads(subprocess.check_output(
+        occ_cmd+['group:list', '--output=json'],
+        universal_newlines=True))
+    for group_folder in group_folders:
+      # try to find a user with access
+      user=None
+      # make sure we have a group assigned to the group folder
+      group_folder_groups = group_folder["groups"]
+      if(isinstance(group_folder_groups,dict) and group_folder_groups):
+        group=list(group_folder["groups"].keys())[0]
+        # make sure the group has at least one user
+        if(groups[group]):
+          user=groups[group][0]
+          if user is not None:
+            path_prefix = '/'+user+'/files/'+group_folder['mount_point'].rstrip('/')
+            data_prefix = data_dir+'/__groupfolders/'+str(group_folder["id"])
+            # only add if we aren't already watching that path
+            if data_prefix not in paths_watched:
+              paths_watched.add(data_prefix)
+              folders.append(Folder(occ_cmd=occ_cmd, path_prefix=path_prefix,
+                                    data_prefix=data_prefix))
+              _logger.debug('Watching group folder %s.', group_folder['mount_point'])
     if instance.external_storage:
       _logger.debug('external storage scan is enabled for Nextcloud at %s',
                     os.path.dirname(instance.occ))
@@ -230,13 +224,27 @@ def watch_instances(instances):
         if user is not None:
           path_prefix = '/'+user+'/files'+storage['mount_point'].rstrip('/')
           data_prefix = storage['configuration']['datadir'].rstrip('/')
-          data_prefix = path_mapper(data_prefix)
-          folders.append(Folder(occ_cmd=occ_cmd, path_prefix=path_prefix,
-                                data_prefix=data_prefix))
-  workers = tuple(map(watch, folders))
+          # only add if we aren't already watching that path
+          if data_prefix not in paths_watched:
+            paths_watched.add(data_prefix)
+            folders.append(Folder(occ_cmd=occ_cmd, path_prefix=path_prefix,
+                                  data_prefix=data_prefix))
+  return paths_watched, tuple(map(watch, folders))
+
+def watch_instances(instances):
+  """Setup inotifywait for the given instances and yield tasks.
+  """
+  paths_watched = set()
+  workers = tuple()
+  instances = tuple(instances)
   min_interval = min(instance.interval for instance in instances)
+  reset_workers = 0
   while True:
     interval = min_interval
+    if reset_workers <= 0:
+      reset_workers = min_interval * 300
+      paths_watched, new_workers = get_workers(instances, paths_watched)
+      workers = workers + new_workers
     for worker in workers:
       task = next(worker)
       if task.paths:
@@ -244,16 +252,18 @@ def watch_instances(instances):
         yield task
     if interval is not None:
       time.sleep(interval)
+      reset_workers -= min_interval
 
 def watch(folder):
   """Setup inotifywait for the given folder and yield tasks.
   """
   data_prefix, path_prefix = folder.data_prefix, folder.path_prefix
   _logger.info('watching %s <=> %s', data_prefix, path_prefix)
+  _logger.debug('path %s', os.path.abspath(data_prefix))
   data_prefix_len = len(data_prefix)
   scan_paths = set()
   inotifywait_proc = subprocess.Popen(
-      ['inotifywait', '--event=create,modify,move,delete', r'--exclude=/\.',
+      ['inotifywait', '--event=create,modify,move,delete',
        '--recursive', '--quiet', '--format=%e/%f%w/', '--monitor',
        os.path.abspath(data_prefix)],   # relative path won't work
       stdout=subprocess.PIPE, bufsize=0)
